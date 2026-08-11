@@ -190,11 +190,11 @@ bool Runtime::install() {
     }
 
     registerAllModules();
-    // Menu registration must not depend on event subscriptions succeeding.
-    // The ModMenu entries are still useful even if a particular BedrockTools
-    // event is unavailable on a given runtime/version.
     wireEvents();
 
+    // Menu registration must not depend on event subscriptions succeeding.
+    // The BedrockTools API can be present even when a particular event
+    // subscription is unavailable; the addon should still expose its modules.
     ModuleRegistry::get().initialize();
 
     randomlythingies::config::ConfigManager::get().load();

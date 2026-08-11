@@ -190,10 +190,10 @@ bool Runtime::install() {
     }
 
     registerAllModules();
+    // Menu registration must not depend on event subscriptions succeeding.
+    // The ModMenu entries are still useful even if a particular BedrockTools
+    // event is unavailable on a given runtime/version.
     wireEvents();
-
-    if (mSubscriptions.empty())
-        return false;
 
     ModuleRegistry::get().initialize();
 

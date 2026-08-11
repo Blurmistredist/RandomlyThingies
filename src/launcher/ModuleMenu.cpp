@@ -67,7 +67,8 @@ void registerModulesWithLauncher() {
         if (!mod->showInMenu) continue;
 
         pl::modmenu::ModuleBuilder builder(mod->moduleId, mod->name);
-        builder.description(mod->description)
+        builder.modId("RandomlyThingies")
+                .description(mod->description)
                 .defaultEnabled(mod->masterEnabled)
                 .hideInHudEditor(mod->hideInHudEditor)
                 .onToggle(onModuleToggle)

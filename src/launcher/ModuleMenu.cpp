@@ -1,6 +1,7 @@
 #include "ModuleMenu.hpp"
 #include "modules/ModuleRegistry.hpp"
 #include "config/ConfigManager.hpp"
+#include "core/Runtime.hpp"
 #include <pl/ModMenu.hpp>
 #include <algorithm>
 #include <cctype>
@@ -12,6 +13,14 @@
 static void onModuleToggle(std::string_view module_id, bool enabled) {
     auto* mod = ModuleRegistry::get().find(module_id);
     if (!mod) return;
+
+    // Do not activate a module before the shared BedrockTools runtime
+    // is ready. The menu can be registered earlier, during mod load.
+    if (enabled &&
+        !randomlythingies::core::Runtime::get().tryInstallFromLoadHook()) {
+        return;
+    }
+
     mod->setMasterEnabled(enabled);
     randomlythingies::config::ConfigManager::get().save();
 }

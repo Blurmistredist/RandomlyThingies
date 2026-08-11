@@ -208,21 +208,30 @@ bool Runtime::load(pl::mod::ModContext& context) {
     if (!launcherContext())
         return true;
 
-    // Register the addon and its ModMenu entries while this lifecycle
-    // callback is executing. Preloader associates ModMenu registrations
-    // made here with this addon automatically.
+    // Register modules before installation so the runtime can initialize
+    // every module (onInit) before loading persisted configuration.
     registerAllModules();
-    randomlythingies::config::ConfigManager::get().load();
-
-    if (!mMenuRegistered) {
-        registerModulesWithLauncher();
-        mMenuRegistered = true;
-    }
 
     if (bedrocktools::api::compatible(
             bedrocktools::api::find())) {
+
+        // BedrockTools is already available. install() resolves signatures,
+        // wires events, calls onInit(), and only then loads configuration.
         install();
+
+        // Keep ModMenu registration inside the RandomlyThingies lifecycle
+        // callback so the preloader associates these entries with this mod.
+        if (!mMenuRegistered) {
+            registerModulesWithLauncher();
+            mMenuRegistered = true;
+        }
     } else {
+        // BedrockTools is not loaded yet. The menu can still be registered
+        // now, but configuration must wait until install()/onInit().
+        if (!mMenuRegistered) {
+            registerModulesWithLauncher();
+            mMenuRegistered = true;
+        }
         installBedrockToolsLoadHook();
     }
 

@@ -2,10 +2,12 @@
 #include "modules/ModuleRegistry.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <numeric>
 #include <string>
+#include <unistd.h>
 
 namespace {
 static FPSGraphModule* g_fpsGraphMod = nullptr;
@@ -14,9 +16,9 @@ float calcTextWidth(const std::string& text, float size) {
     float width = 0.0f;
     for (char c : text) {
         if (c == 'i' || c == 'l' || c == '1' || c == ':' || c == '.' || c == ' ')
-            width += size * 0.3f;
+            width += size * 0.30f;
         else if (c == 'm' || c == 'w' || c == 'M' || c == 'W')
-            width += size * 0.8f;
+            width += size * 0.80f;
         else
             width += size * 0.58f;
     }
@@ -31,7 +33,7 @@ uint32_t applyAlpha(uint32_t color, float alpha) {
 }
 
 FPSGraphModule::FPSGraphModule()
-    : Module("FPS Graph", "Shows a live FPS history graph on screen.") {
+    : Module("FPS Graph", "Detailed FPS, frame-time and performance graph.") {
     g_fpsGraphMod = this;
 }
 
@@ -44,66 +46,177 @@ void FPSGraphModule::onEnable() {
     m_lastFrame = Clock::now();
     m_fakeStart = Clock::now();
     m_hasLastFrame = false;
-    m_history.clear();
+
+    m_fpsHistory.clear();
+    m_jitterHistory.clear();
+    m_ramHistory.clear();
+    m_pingHistory.clear();
+    m_low1History.clear();
+    m_msptHistory.clear();
+    m_tpsHistory.clear();
+
     m_currentFps = 0.0f;
     m_averageFps = 0.0f;
-    m_peakFps = 0.0f;
+    m_jitterMs = 0.0f;
+    m_ramGb = 0.0f;
+    m_pingMs = 0.0f;
+    m_onePercentLow = 0.0f;
+    m_mspt = 0.0f;
+    m_tps = 20.0f;
 }
 
 void FPSGraphModule::onDisable() {
     m_hasLastFrame = false;
-    m_history.clear();
+    m_fpsHistory.clear();
+    m_jitterHistory.clear();
+    m_ramHistory.clear();
+    m_pingHistory.clear();
+    m_low1History.clear();
+    m_msptHistory.clear();
+    m_tpsHistory.clear();
 }
 
 float FPSGraphModule::getDisplayedFps(float realFps) const {
     if (!m_superPerformanceModeThing)
         return realFps;
 
-    /*
-     * Cosmetic moving value, deliberately constrained to 2000-3000.
-     *
-     * Multiple sine waves give it a smooth, non-repeating feel instead
-     * of jumping randomly every frame.
-     */
-    const auto now = Clock::now();
-    const float t =
-        std::chrono::duration<float>(now - m_fakeStart).count();
+    const float t = std::chrono::duration<float>(Clock::now() - m_fakeStart).count();
+    const float wave =
+        0.50f +
+        0.25f * std::sin(t * 1.17f) +
+        0.15f * std::sin(t * 2.31f + 1.7f) +
+        0.10f * std::sin(t * 0.43f + 0.8f);
 
-    const float wave1 = std::sin(t * 1.17f);
-    const float wave2 = std::sin(t * 2.31f + 1.7f);
-    const float wave3 = std::sin(t * 0.43f + 0.8f);
+    return 2000.0f + std::clamp(wave, 0.0f, 1.0f) * 1000.0f;
+}
 
-    const float normalized =
-        std::clamp(
-            0.50f +
-            wave1 * 0.25f +
-            wave2 * 0.15f +
-            wave3 * 0.10f,
-            0.0f,
-            1.0f);
+void FPSGraphModule::pushHistory(std::vector<float>& history, float value) {
+    history.push_back(value);
+    const std::size_t maxSize = static_cast<std::size_t>(std::max(16, m_historySize));
+    if (history.size() > maxSize) {
+        history.erase(history.begin(), history.begin() + (history.size() - maxSize));
+    }
+}
 
-    return 2000.0f + normalized * 1000.0f;
+float FPSGraphModule::readResidentMemoryGb() const {
+    std::ifstream file("/proc/self/statm");
+    long pages = 0;
+    long resident = 0;
+    if (!(file >> pages >> resident) || resident <= 0)
+        return 0.0f;
+
+    const long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize <= 0)
+        return 0.0f;
+
+    const double bytes = static_cast<double>(resident) * static_cast<double>(pageSize);
+    return static_cast<float>(bytes / (1024.0 * 1024.0 * 1024.0));
 }
 
 void FPSGraphModule::rebuildStatistics() {
-    if (m_history.empty()) {
+    if (m_fpsHistory.empty()) {
         m_averageFps = 0.0f;
-        m_peakFps = 0.0f;
+        m_onePercentLow = 0.0f;
         return;
     }
 
-    float sum = 0.0f;
-    float peak = 0.0f;
+    const float sum = std::accumulate(m_fpsHistory.begin(), m_fpsHistory.end(), 0.0f);
+    m_averageFps = sum / static_cast<float>(m_fpsHistory.size());
 
-    for (const float fps : m_history) {
-        sum += fps;
-        peak = std::max(peak, fps);
+    // Standard 1% low: average of the slowest 1% of samples.
+    std::vector<float> sorted = m_fpsHistory;
+    std::sort(sorted.begin(), sorted.end());
+    const std::size_t count = std::max<std::size_t>(1, sorted.size() / 100);
+    const float lowSum = std::accumulate(sorted.begin(), sorted.begin() + count, 0.0f);
+    m_onePercentLow = lowSum / static_cast<float>(count);
+}
+
+void FPSGraphModule::drawText(std::vector<PLModMenu_DrawCommand>& cmds,
+                              const std::string& text,
+                              float x, float y, float size, uint32_t color) const {
+    PLModMenu_DrawCommand cmd = {};
+    cmd.type = PL_DRAW_TEXT;
+    cmd.x = x;
+    cmd.y = y;
+    cmd.w = calcTextWidth(text, size) + 8.0f;
+    cmd.h = size + 2.0f;
+    cmd.color = color;
+    cmd.size = size;
+    cmd.text = text.c_str();
+    cmds.push_back(cmd);
+}
+
+void FPSGraphModule::drawMetricRow(
+    std::vector<PLModMenu_DrawCommand>& cmds,
+    const char* label,
+    float value,
+    const char* unit,
+    const std::vector<float>& history,
+    float minValue,
+    float maxValue,
+    uint32_t color,
+    float x,
+    float y,
+    float width,
+    float rowHeight) const {
+
+    char valueBuffer[48];
+    if (std::string(unit) == "gb")
+        std::snprintf(valueBuffer, sizeof(valueBuffer), "%.1f", value);
+    else if (std::string(unit) == "ms")
+        std::snprintf(valueBuffer, sizeof(valueBuffer), "%.1f", value);
+    else if (std::string(unit) == "tps")
+        std::snprintf(valueBuffer, sizeof(valueBuffer), "%.1f", value);
+    else
+        std::snprintf(valueBuffer, sizeof(valueBuffer), "%.0f", value);
+
+    const float labelX = x + 8.0f;
+    const float valueX = x + width * 0.57f;
+    const float unitX = x + width * 0.83f;
+
+    drawText(cmds, label, labelX, y, m_size, 0xFFD9E2EE);
+    drawText(cmds, valueBuffer, valueX, y, m_size + 1.0f, color);
+    drawText(cmds, unit, unitX, y + 1.0f, m_size - 1.0f, 0xFFD0A66A);
+
+    const float graphY = y + m_size + 5.0f;
+    const float graphH = std::max(8.0f, rowHeight - m_size - 7.0f);
+
+    PLModMenu_DrawCommand base = {};
+    base.type = PL_DRAW_RECT_FILLED;
+    base.x = x + 8.0f;
+    base.y = graphY;
+    base.w = width - 16.0f;
+    base.h = graphH;
+    base.color = applyAlpha(0x182331, 0.92f);
+    cmds.push_back(base);
+
+    if (history.empty())
+        return;
+
+    const float range = std::max(0.001f, maxValue - minValue);
+    const float step = (width - 16.0f) / static_cast<float>(std::max<std::size_t>(1, history.size()));
+    const float barW = std::max(1.0f, step * 0.82f);
+
+    const std::size_t start = history.size() > static_cast<std::size_t>(m_historySize)
+        ? history.size() - static_cast<std::size_t>(m_historySize)
+        : 0;
+
+    for (std::size_t i = start; i < history.size(); ++i) {
+        const float sample = std::clamp(history[i], minValue, maxValue);
+        const float normalized = (sample - minValue) / range;
+        const float barH = std::max(1.0f, graphH * normalized);
+        const float bx = x + 8.0f + static_cast<float>(i - start) * step;
+        const float by = graphY + graphH - barH;
+
+        PLModMenu_DrawCommand bar = {};
+        bar.type = PL_DRAW_RECT_FILLED;
+        bar.x = bx;
+        bar.y = by;
+        bar.w = barW;
+        bar.h = barH;
+        bar.color = color;
+        cmds.push_back(bar);
     }
-
-    m_averageFps =
-        sum / static_cast<float>(m_history.size());
-
-    m_peakFps = peak;
 }
 
 void FPSGraphModule::onFrame() {
@@ -111,31 +224,14 @@ void FPSGraphModule::onFrame() {
         return;
 
     const auto now = Clock::now();
+    float realFps = m_currentFps;
+    float frameMs = m_mspt;
 
     if (m_hasLastFrame) {
-        const std::chrono::duration<float> dt =
-            now - m_lastFrame;
-
-        const float seconds = dt.count();
-
-        if (seconds > 0.000001f) {
-            const float realFps = 1.0f / seconds;
-            const float displayedFps =
-                getDisplayedFps(realFps);
-
-            m_currentFps = displayedFps;
-
-            m_history.push_back(displayedFps);
-
-            if (static_cast<int>(m_history.size()) > m_historySize) {
-                m_history.erase(
-                    m_history.begin(),
-                    m_history.begin() +
-                        (m_history.size() -
-                         static_cast<std::size_t>(m_historySize)));
-            }
-
-            rebuildStatistics();
+        const float seconds = std::chrono::duration<float>(now - m_lastFrame).count();
+        if (seconds > 0.000001f && seconds < 2.0f) {
+            realFps = 1.0f / seconds;
+            frameMs = seconds * 1000.0f;
         }
     } else {
         m_hasLastFrame = true;
@@ -143,330 +239,201 @@ void FPSGraphModule::onFrame() {
 
     m_lastFrame = now;
 
+    const float displayedFps = getDisplayedFps(realFps);
+    m_currentFps = displayedFps;
+    m_mspt = frameMs;
+
+    // Jitter is the standard deviation of recent frame times.
+    pushHistory(m_msptHistory, frameMs);
+    if (m_msptHistory.size() >= 2) {
+        const float mean = std::accumulate(m_msptHistory.begin(), m_msptHistory.end(), 0.0f) /
+                           static_cast<float>(m_msptHistory.size());
+        float variance = 0.0f;
+        for (float sample : m_msptHistory) {
+            const float d = sample - mean;
+            variance += d * d;
+        }
+        m_jitterMs = std::sqrt(variance / static_cast<float>(m_msptHistory.size()));
+    }
+
+    m_ramGb = readResidentMemoryGb();
+
+    // The standalone addon does not own the network/tick hooks. Keep these
+    // values isolated so the real BedrockTools network/tick feeds can be
+    // wired later without changing the UI implementation.
+    m_pingMs = std::max(0.0f, m_pingMs);
+    m_tps = std::clamp(1000.0f / std::max(1.0f, frameMs), 0.0f, 20.0f);
+
+    pushHistory(m_fpsHistory, displayedFps);
+    pushHistory(m_jitterHistory, m_jitterMs);
+    pushHistory(m_ramHistory, m_ramGb);
+    pushHistory(m_pingHistory, m_pingMs);
+    pushHistory(m_low1History, m_onePercentLow);
+    pushHistory(m_tpsHistory, m_tps);
+    rebuildStatistics();
+
     std::vector<PLModMenu_DrawCommand> cmds;
 
-    const float pad = 6.0f;
-    const float graphX = hudPosX;
-    const float graphY = hudPosY;
-    const float graphW = std::max(70.0f, m_width);
-    const float graphH = std::max(36.0f, m_height);
+    const float x = hudPosX;
+    const float y = hudPosY;
+    const float w = std::max(260.0f, m_width);
+    const float h = std::max(120.0f, m_height);
 
-    /*
-     * Numbers-only mode intentionally skips all graph/background/grid
-     * rendering. This makes the compact mode actually compact.
-     */
+    if (m_background) {
+        PLModMenu_DrawCommand bg = {};
+        bg.type = PL_DRAW_RECT_FILLED;
+        bg.x = x;
+        bg.y = y;
+        bg.w = w;
+        bg.h = h;
+        bg.color = applyAlpha(0x070B10, m_backgroundOpacity);
+        cmds.push_back(bg);
+    }
+
     if (m_numbersOnly) {
-        const float line = m_size + 3.0f;
-        const float textX = graphX + pad;
-        float textY = graphY + 2.0f;
+        const float left = x + 12.0f;
+        const float valueX = x + w * 0.58f;
+        const float unitX = x + w * 0.83f;
+        float row = y + 8.0f;
 
-        char buf[128];
+        auto numberRow = [&](const char* label, float value, const char* unit,
+                             int decimals, uint32_t color) {
+            char buf[64];
+            if (decimals == 0)
+                std::snprintf(buf, sizeof(buf), "%.0f", value);
+            else if (decimals == 1)
+                std::snprintf(buf, sizeof(buf), "%.1f", value);
+            else
+                std::snprintf(buf, sizeof(buf), "%.2f", value);
 
-        std::snprintf(
-            buf,
-            sizeof(buf),
-            "FPS %.0f",
-            m_currentFps);
+            drawText(cmds, label, left, row, m_size, 0xFFD9E2EE);
+            drawText(cmds, buf, valueX, row, m_size + 1.0f, color);
+            drawText(cmds, unit, unitX, row + 1.0f, m_size - 1.0f, 0xFFD0A66A);
+            row += m_size + 8.0f;
+        };
 
-        PLModMenu_DrawCommand fpsCmd = {};
-        fpsCmd.type = PL_DRAW_TEXT;
-        fpsCmd.x = textX;
-        fpsCmd.y = textY;
-        fpsCmd.w = calcTextWidth(buf, m_size) + 8.0f;
-        fpsCmd.h = m_size + 2.0f;
-        fpsCmd.color = 0xFFFFFFFF;
-        fpsCmd.size = m_size;
-        fpsCmd.text = buf;
-        cmds.push_back(fpsCmd);
+        numberRow("FPS", m_currentFps, "fps", 0, 0xFF39F08A);
+        numberRow("Avg", m_averageFps, "fps", 0, 0xFF39F08A);
 
-        textY += line;
+        PLModMenu_DrawCommand divider = {};
+        divider.type = PL_DRAW_RECT_FILLED;
+        divider.x = x + 12.0f;
+        divider.y = row + 2.0f;
+        divider.w = w - 24.0f;
+        divider.h = 2.0f;
+        divider.color = 0xFF344553;
+        cmds.push_back(divider);
+        row += 10.0f;
 
-        std::snprintf(
-            buf,
-            sizeof(buf),
-            "Avg %.0f",
-            m_averageFps);
-
-        PLModMenu_DrawCommand avgCmd = {};
-        avgCmd.type = PL_DRAW_TEXT;
-        avgCmd.x = textX;
-        avgCmd.y = textY;
-        avgCmd.w = calcTextWidth(buf, m_size) + 8.0f;
-        avgCmd.h = m_size + 2.0f;
-        avgCmd.color = 0xFFFFFFFF;
-        avgCmd.size = m_size;
-        avgCmd.text = buf;
-        cmds.push_back(avgCmd);
-
-        textY += line;
-
-        std::snprintf(
-            buf,
-            sizeof(buf),
-            "Max %.0f",
-            m_peakFps);
-
-        PLModMenu_DrawCommand maxCmd = {};
-        maxCmd.type = PL_DRAW_TEXT;
-        maxCmd.x = textX;
-        maxCmd.y = textY;
-        maxCmd.w = calcTextWidth(buf, m_size) + 8.0f;
-        maxCmd.h = m_size + 2.0f;
-        maxCmd.color = 0xFFFFFFFF;
-        maxCmd.size = m_size;
-        maxCmd.text = buf;
-        cmds.push_back(maxCmd);
+        numberRow("Jitter", m_jitterMs, "ms", 1, 0xFFB66CFF);
+        numberRow("RAM", m_ramGb, "gb", 1, 0xFF4EEA83);
+        numberRow("Ping", m_pingMs, "ms", 0, 0xFFFFB24C);
+        numberRow("1%Low", m_onePercentLow, "fps", 0, 0xFFFFB24C);
+        numberRow("MSPT", m_mspt, "ms", 1, 0xFFFFB24C);
+        numberRow("TPS", m_tps, "tps", 1, 0xFF7BE36B);
 
         submitDrawCommands(moduleId, cmds);
         return;
     }
 
-    const float innerX = graphX + pad;
-    const float innerY =
-        graphY + pad +
-        (m_showStats ? (m_size + 4.0f) : 0.0f);
+    // Header: FPS and average.
+    drawText(cmds, "FPS", x + 12.0f, y + 8.0f, m_size + 2.0f, 0xFFD9E2EE);
+    char fpsBuf[32];
+    std::snprintf(fpsBuf, sizeof(fpsBuf), "%.0f", m_currentFps);
+    drawText(cmds, fpsBuf, x + w * 0.62f, y + 5.0f, m_size + 5.0f, 0xFF39F08A);
+    drawText(cmds, "fps", x + w * 0.84f, y + 9.0f, m_size, 0xFFD0A66A);
 
-    const float innerW =
-        graphW - pad * 2.0f;
+    char avgBuf[32];
+    std::snprintf(avgBuf, sizeof(avgBuf), "%.0f", m_averageFps);
+    drawText(cmds, "Avg", x + 12.0f, y + 31.0f, m_size + 1.0f, 0xFFD9E2EE);
+    drawText(cmds, avgBuf, x + w * 0.62f, y + 28.0f, m_size + 3.0f, 0xFF39F08A);
+    drawText(cmds, "fps", x + w * 0.84f, y + 32.0f, m_size - 1.0f, 0xFFD0A66A);
 
-    const float innerH =
-        graphH -
-        pad * 2.0f -
-        (m_showStats ? (m_size + 4.0f) : 0.0f);
+    PLModMenu_DrawCommand divider = {};
+    divider.type = PL_DRAW_RECT_FILLED;
+    divider.x = x + 12.0f;
+    divider.y = y + 55.0f;
+    divider.w = w - 24.0f;
+    divider.h = 2.0f;
+    divider.color = 0xFF344553;
+    cmds.push_back(divider);
 
-    if (m_background) {
-        PLModMenu_DrawCommand bgCmd = {};
-        bgCmd.type = PL_DRAW_RECT_FILLED;
-        bgCmd.x = graphX;
-        bgCmd.y = graphY;
-        bgCmd.w = graphW;
-        bgCmd.h = graphH;
-        bgCmd.color =
-            applyAlpha(
-                0x000000,
-                m_backgroundOpacity);
-        cmds.push_back(bgCmd);
-    }
+    const float startY = y + 63.0f;
+    const float available = h - 69.0f;
+    const float rowH = std::max(27.0f, available / 6.0f);
 
-    const float step =
-        innerW /
-        static_cast<float>(
-            std::max(1, m_historySize));
+    // The graph is deliberately made from filled rectangular samples rather
+    // than a single connected line, matching the blocky reference UI.
+    drawMetricRow(cmds, "Jitter", m_jitterMs, "ms", m_jitterHistory,
+                  0.0f, std::max(5.0f, m_jitterMs * 2.0f + 1.0f),
+                  0xFF9E69E8, x, startY + rowH * 0.0f, w, rowH);
 
-    const float barW =
-        std::max(1.0f, step * 0.85f);
+    drawMetricRow(cmds, "RAM", m_ramGb, "gb", m_ramHistory,
+                  0.0f, std::max(2.0f, m_ramGb * 1.5f + 0.5f),
+                  0xFF55C66B, x, startY + rowH * 1.0f, w, rowH);
 
-    const std::size_t startIndex =
-        m_history.size() >
-            static_cast<std::size_t>(m_historySize)
-            ? m_history.size() -
-                  static_cast<std::size_t>(m_historySize)
-            : 0;
+    drawMetricRow(cmds, "Ping", m_pingMs, "ms", m_pingHistory,
+                  0.0f, std::max(100.0f, m_pingMs * 1.5f + 10.0f),
+                  0xFF2D9CB8, x, startY + rowH * 2.0f, w, rowH);
 
-    if (m_showGrid) {
-        constexpr int lines = 4;
+    drawMetricRow(cmds, "1%Low", m_onePercentLow, "fps", m_low1History,
+                  0.0f, std::max(60.0f, m_scaleFps),
+                  0xFFD18C27, x, startY + rowH * 3.0f, w, rowH);
 
-        for (int i = 1; i < lines; ++i) {
-            PLModMenu_DrawCommand line = {};
-            line.type = PL_DRAW_LINE;
-            line.x = innerX;
-            line.y =
-                innerY +
-                (innerH / lines) * i;
-            line.w = innerW;
-            line.h = 0.0f;
-            line.size = 1.0f;
-            line.color = 0x3AFFFFFF;
-            cmds.push_back(line);
-        }
-    }
+    drawMetricRow(cmds, "MSPT", m_mspt, "ms", m_msptHistory,
+                  0.0f, std::max(20.0f, m_mspt * 2.0f + 1.0f),
+                  0xFFE29A2F, x, startY + rowH * 4.0f, w, rowH);
 
-    for (std::size_t i = startIndex;
-         i < m_history.size();
-         ++i) {
+    drawMetricRow(cmds, "TPS", m_tps, "tps", m_tpsHistory,
+                  0.0f, 20.0f,
+                  0xFF72D56A, x, startY + rowH * 5.0f, w, rowH);
 
-        const float fps =
-            m_history[i];
-
-        const float normalized =
-            std::clamp(
-                fps /
-                    std::max(
-                        1.0f,
-                        m_scaleFps),
-                0.0f,
-                1.0f);
-
-        const float barH =
-            std::max(
-                1.0f,
-                innerH * normalized);
-
-        const float x =
-            innerX +
-            static_cast<float>(
-                i - startIndex) *
-                step;
-
-        const float y =
-            innerY +
-            (innerH - barH);
-
-        uint32_t color =
-            0xFF3CD23C;
-
-        if (!m_superPerformanceModeThing) {
-            if (fps < 30.0f)
-                color = 0xFFFF4D4D;
-            else if (fps < 60.0f)
-                color = 0xFFFFC64D;
-            else if (fps < 90.0f)
-                color = 0xFF5AC8FA;
-        } else {
-            // Keep the easter-egg graph consistently "super".
-            color = 0xFF3CFF78;
-        }
-
-        PLModMenu_DrawCommand barCmd = {};
-        barCmd.type = PL_DRAW_RECT_FILLED;
-        barCmd.x = x;
-        barCmd.y = y;
-        barCmd.w = barW;
-        barCmd.h = barH;
-        barCmd.color = color;
-        cmds.push_back(barCmd);
-    }
-
-    if (m_showStats) {
-        char buf[128];
-
-        std::snprintf(
-            buf,
-            sizeof(buf),
-            "FPS %.0f  AVG %.0f  MAX %.0f",
-            m_currentFps,
-            m_averageFps,
-            m_peakFps);
-
-        PLModMenu_DrawCommand txtCmd = {};
-        txtCmd.type = PL_DRAW_TEXT;
-        txtCmd.x = graphX + pad;
-        txtCmd.y = graphY + 2.0f;
-        txtCmd.w =
-            calcTextWidth(buf, m_size) + 8.0f;
-        txtCmd.h = m_size + 2.0f;
-        txtCmd.color = 0xFFFFFFFF;
-        txtCmd.size = m_size;
-        txtCmd.text = buf;
-        cmds.push_back(txtCmd);
-    }
-
-    submitDrawCommands(
-        moduleId,
-        cmds);
+    submitDrawCommands(moduleId, cmds);
 }
 
-void FPSGraphModule::loadConfig(
-    const nlohmann::json& j) {
-
+void FPSGraphModule::loadConfig(const nlohmann::json& j) {
     Module::loadConfig(j);
 
-    if (j.contains("hudPosX"))
-        hudPosX = j["hudPosX"].get<float>();
+    if (j.contains("hudPosX")) hudPosX = j["hudPosX"].get<float>();
+    if (j.contains("hudPosY")) hudPosY = j["hudPosY"].get<float>();
+    if (j.contains("isHudModule")) isHudModule = j["isHudModule"].get<bool>();
+    if (j.contains("m_width")) m_width = j["m_width"].get<float>();
+    if (j.contains("m_height")) m_height = j["m_height"].get<float>();
+    if (j.contains("m_size")) m_size = j["m_size"].get<float>();
+    if (j.contains("m_historySize")) m_historySize = j["m_historySize"].get<int>();
+    if (j.contains("m_scaleFps")) m_scaleFps = j["m_scaleFps"].get<float>();
+    if (j.contains("m_background")) m_background = j["m_background"].get<bool>();
+    if (j.contains("m_backgroundOpacity")) m_backgroundOpacity = j["m_backgroundOpacity"].get<float>();
+    if (j.contains("m_showStats")) m_showStats = j["m_showStats"].get<bool>();
+    if (j.contains("m_showGrid")) m_showGrid = j["m_showGrid"].get<bool>();
+    if (j.contains("m_numbersOnly")) m_numbersOnly = j["m_numbersOnly"].get<bool>();
+    if (j.contains("m_superPerformanceModeThing")) m_superPerformanceModeThing = j["m_superPerformanceModeThing"].get<bool>();
 
-    if (j.contains("hudPosY"))
-        hudPosY = j["hudPosY"].get<float>();
-
-    if (j.contains("isHudModule"))
-        isHudModule =
-            j["isHudModule"].get<bool>();
-
-    if (j.contains("m_width"))
-        m_width =
-            j["m_width"].get<float>();
-
-    if (j.contains("m_height"))
-        m_height =
-            j["m_height"].get<float>();
-
-    if (j.contains("m_size"))
-        m_size =
-            j["m_size"].get<float>();
-
-    if (j.contains("m_historySize"))
-        m_historySize =
-            j["m_historySize"].get<int>();
-
-    if (j.contains("m_scaleFps"))
-        m_scaleFps =
-            j["m_scaleFps"].get<float>();
-
-    if (j.contains("m_background"))
-        m_background =
-            j["m_background"].get<bool>();
-
-    if (j.contains("m_backgroundOpacity"))
-        m_backgroundOpacity =
-            j["m_backgroundOpacity"].get<float>();
-
-    if (j.contains("m_showStats"))
-        m_showStats =
-            j["m_showStats"].get<bool>();
-
-    if (j.contains("m_showGrid"))
-        m_showGrid =
-            j["m_showGrid"].get<bool>();
-
-    if (j.contains("m_numbersOnly"))
-        m_numbersOnly =
-            j["m_numbersOnly"].get<bool>();
-
-    if (j.contains("m_superPerformanceModeThing"))
-        m_superPerformanceModeThing =
-            j["m_superPerformanceModeThing"].get<bool>();
-
-    m_historySize =
-        std::max(10, m_historySize);
-
-    m_scaleFps =
-        std::max(1.0f, m_scaleFps);
-
-    m_backgroundOpacity =
-        std::clamp(
-            m_backgroundOpacity,
-            0.0f,
-            1.0f);
-
-    m_size =
-        std::max(1.0f, m_size);
+    m_width = std::max(260.0f, m_width);
+    m_height = std::max(120.0f, m_height);
+    m_size = std::max(10.0f, m_size);
+    m_historySize = std::clamp(m_historySize, 16, 240);
+    m_scaleFps = std::max(30.0f, m_scaleFps);
+    m_backgroundOpacity = std::clamp(m_backgroundOpacity, 0.0f, 1.0f);
 }
 
-void FPSGraphModule::saveConfig(
-    nlohmann::json& j) {
-
+void FPSGraphModule::saveConfig(nlohmann::json& j) {
     Module::saveConfig(j);
 
     j["hudPosX"] = hudPosX;
     j["hudPosY"] = hudPosY;
     j["isHudModule"] = isHudModule;
-
     j["m_width"] = m_width;
     j["m_height"] = m_height;
     j["m_size"] = m_size;
     j["m_historySize"] = m_historySize;
     j["m_scaleFps"] = m_scaleFps;
     j["m_background"] = m_background;
-    j["m_backgroundOpacity"] =
-        m_backgroundOpacity;
+    j["m_backgroundOpacity"] = m_backgroundOpacity;
     j["m_showStats"] = m_showStats;
     j["m_showGrid"] = m_showGrid;
+    j["m_numbersOnly"] = m_numbersOnly;
 
-    j["m_numbersOnly"] =
-        m_numbersOnly;
-
-    // Keep this as the final FPS-specific config entry.
-    // ModuleMenu.cpp needs the small ordering patch below to guarantee
-    // it is rendered as the final setting.
-    j["m_superPerformanceModeThing"] =
-        m_superPerformanceModeThing;
+    // Keep this as the final FPS-specific setting in the JSON object.
+    j["m_superPerformanceModeThing"] = m_superPerformanceModeThing;
 }

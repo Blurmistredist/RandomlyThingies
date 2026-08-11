@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../Module.hpp"
+#include "../ModuleRegistry.hpp"
 #include <chrono>
 #include <vector>
 

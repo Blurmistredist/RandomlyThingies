@@ -174,8 +174,8 @@ void Runtime::wireEvents() {
         });
 }
 
-void Runtime::tryInstallFromLoadHook() {
-    install();
+bool Runtime::tryInstallFromLoadHook() {
+    return install();
 }
 
 bool Runtime::install() {
@@ -192,13 +192,7 @@ bool Runtime::install() {
     registerAllModules();
     wireEvents();
 
-    // Menu registration must not depend on event subscriptions succeeding.
-    // The BedrockTools API can be present even when a particular event
-    // subscription is unavailable; the addon should still expose its modules.
     ModuleRegistry::get().initialize();
-
-    randomlythingies::config::ConfigManager::get().load();
-    registerModulesWithLauncher();
 
     mInstalled = true;
     return true;
@@ -213,6 +207,17 @@ bool Runtime::load(pl::mod::ModContext& context) {
 
     if (!launcherContext())
         return true;
+
+    // Register the addon and its ModMenu entries while this lifecycle
+    // callback is executing. Preloader associates ModMenu registrations
+    // made here with this addon automatically.
+    registerAllModules();
+    randomlythingies::config::ConfigManager::get().load();
+
+    if (!mMenuRegistered) {
+        registerModulesWithLauncher();
+        mMenuRegistered = true;
+    }
 
     if (bedrocktools::api::compatible(
             bedrocktools::api::find())) {

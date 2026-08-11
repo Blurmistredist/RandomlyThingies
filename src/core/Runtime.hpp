@@ -15,7 +15,7 @@ public:
     bool enable(pl::mod::ModContext& context);
     bool disable(pl::mod::ModContext& context);
     bool unload(pl::mod::ModContext& context);
-    void tryInstallFromLoadHook();
+    bool tryInstallFromLoadHook();
 
 private:
     bool install();
@@ -26,6 +26,7 @@ private:
     std::filesystem::path mResourceDirectory;
     std::vector<std::uint64_t> mSubscriptions;
     bool mInstalled = false;
+    bool mMenuRegistered = false;
 };
 
 }
